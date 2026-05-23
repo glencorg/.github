@@ -1,0 +1,101 @@
+name: Ollama Code Review
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        required: false
+        type: string
+        default: "gpt-oss:120b"
+      max_diff_chars:
+        required: false
+        type: number
+        default: 60000
+    secrets:
+      OLLAMA_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build PR diff
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          git diff --no-ext-diff origin/${{ github.base_ref }}...HEAD > pr.diff
+
+      - name: Ask Ollama Cloud for review
+        env:
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+          OLLAMA_MODEL: ${{ inputs.model }}
+          MAX_DIFF_CHARS: ${{ inputs.max_diff_chars }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          diff = Path("pr.diff").read_text(errors="ignore")
+          max_chars = int(os.environ.get("MAX_DIFF_CHARS", "60000"))
+          diff = diff[:max_chars]
+
+          prompt = f"""
+          You are reviewing a GitHub pull request.
+
+          Focus on:
+          - bugs
+          - security issues
+          - broken logic
+          - missing error handling
+          - maintainability problems
+          - risky changes
+
+          Do not nitpick formatting.
+          Do not comment on unchanged code.
+          Be concise.
+          If there are no meaningful issues, say so.
+
+          Pull request diff:
+
+          {diff}
+          """
+
+          request = {
+              "model": os.environ["OLLAMA_MODEL"],
+              "messages": [
+                  {
+                      "role": "user",
+                      "content": prompt
+                  }
+              ],
+              "stream": False
+          }
+
+          Path("request.json").write_text(json.dumps(request))
+          PY
+
+          curl -sS https://ollama.com/api/chat \
+            -H "Authorization: Bearer $OLLAMA_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @request.json \
+            > response.json
+
+          jq -r '.message.content // .response // "No review returned from Ollama."' response.json > review.md
+
+      - name: Post PR review comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            -f body="$(printf '## Ollama Code Review\n\n%s' "$(cat review.md)")"
