@@ -1,45 +1,64 @@
 name: Ollama Code Review
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Ollama model
+        required: false
+        default: gpt-oss:120b
+      max_diff_chars:
+        description: Maximum diff characters to send
+        required: false
+        default: "60000"
   workflow_call:
     inputs:
       model:
         required: false
         type: string
-        default: "gpt-oss:120b"
+        default: gpt-oss:120b
       max_diff_chars:
         required: false
-        type: number
-        default: 60000
+        type: string
+        default: "60000"
     secrets:
       OLLAMA_API_KEY:
-        required: true
+        required: false
 
 permissions:
   contents: read
-  pull-requests: write
   issues: write
+  pull-requests: write
 
 jobs:
   review:
+    name: Ask Ollama Cloud for review
     runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout PR
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    env:
+      OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+      OLLAMA_MODEL: ${{ inputs.model || 'gpt-oss:120b' }}
+      MAX_DIFF_CHARS: ${{ inputs.max_diff_chars || '60000' }}
 
-      - name: Build PR diff
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get PR diff
+        if: github.event_name == 'pull_request'
         run: |
-          git fetch origin ${{ github.base_ref }}
-          git diff --no-ext-diff origin/${{ github.base_ref }}...HEAD > pr.diff
+          gh pr diff "${{ github.event.pull_request.number }}" > pr.diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create empty diff for manual run
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "Manual workflow run. No pull request diff was available." > pr.diff
 
       - name: Ask Ollama Cloud for review
-        env:
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-          OLLAMA_MODEL: ${{ inputs.model }}
-          MAX_DIFF_CHARS: ${{ inputs.max_diff_chars }}
         run: |
           python3 <<'PY'
           import json
@@ -63,8 +82,33 @@ jobs:
 
           Do not nitpick formatting.
           Do not comment on unchanged code.
+          Only report issues that are directly supported by the diff.
+          Do not report generic risks that apply to any AI review workflow unless this diff newly introduces a concrete exposure.
           Be concise.
-          If there are no meaningful issues, say so.
+          If there are no meaningful issues, write exactly:
+
+          ## Findings
+          No actionable findings.
+
+          ## Non-blocking Notes
+          None.
+
+          Otherwise, use exactly this Markdown structure:
+
+          ## Findings
+          1. Severity: Critical|High|Medium|Low
+             File: path/to/file.ext
+             Line: line number if available, otherwise "not available"
+             Claim: one sentence describing the issue
+             Evidence: quote or summarize the specific changed code that supports the claim
+             Why it matters: one or two sentences about the concrete failure mode
+             Suggested fix: one or two sentences with the smallest safe fix
+
+          ## Non-blocking Notes
+          - Optional notes only. Put "None." when there are none.
+
+          Do not use tables.
+          Do not include broad commentary, praise, or merge recommendations.
 
           Pull request diff:
 
@@ -85,17 +129,103 @@ jobs:
           Path("request.json").write_text(json.dumps(request))
           PY
 
-          curl -sS https://ollama.com/api/chat \
+          if [ -z "$OLLAMA_API_KEY" ]; then
+            echo "OLLAMA_API_KEY is not set; skipping Ollama review." | tee review.md
+            exit 0
+          fi
+
+          http_code=$(curl -sS -w "%{http_code}" \
+            -o response.json \
+            https://ollama.com/api/chat \
             -H "Authorization: Bearer $OLLAMA_API_KEY" \
             -H "Content-Type: application/json" \
-            -d @request.json \
-            > response.json
+            -d @request.json)
+
+          echo "Ollama HTTP status: $http_code"
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "Ollama request failed. Response:"
+            cat response.json
+            exit 1
+          fi
+
+          if ! jq empty response.json >/dev/null 2>&1; then
+            echo "Ollama returned invalid JSON. Response:"
+            cat response.json
+            exit 1
+          fi
 
           jq -r '.message.content // .response // "No review returned from Ollama."' response.json > review.md
 
-      - name: Post PR review comment
+          python3 <<'PY'
+          import re
+          from pathlib import Path
+
+          review_path = Path("review.md")
+          review = review_path.read_text(errors="ignore")
+          token_patterns = [
+              r"AKIA[0-9A-Z]{16}",
+              r"AIza[0-9A-Za-z_\-]{35}",
+              r"gh[pousr]_[0-9A-Za-z_]{36,255}",
+          ]
+          for pattern in token_patterns:
+              review = re.sub(pattern, "[redacted]", review)
+
+          review = re.sub(
+              r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+              "[redacted]",
+              review,
+              flags=re.DOTALL,
+          )
+          review = re.sub(
+              r"^([ \t]*(?:api[_-]?key|token|secret|password|client[_-]?secret)[ \t]*[:=][ \t]*).+$",
+              r"\1[redacted]",
+              review,
+              flags=re.IGNORECASE | re.MULTILINE,
+          )
+
+          max_comment_chars = 60000
+          if len(review) > max_comment_chars:
+              review = review[:max_comment_chars] + "\n\n[Review truncated to fit GitHub comment limits.]"
+
+          review_path.write_text(review)
+          PY
+
+      - name: Show review
+        run: cat review.md
+
+      - name: Publish review comment
+        if: github.event_name == 'pull_request' && env.OLLAMA_API_KEY != ''
+        run: |
+          set -euo pipefail
+
+          marker="<!-- ollama-cloud-code-review -->"
+          body_file="comment.md"
+          {
+            echo "$marker"
+            echo "## Ollama Cloud code review"
+            echo
+            cat review.md
+            echo
+            echo "## Agent handoff"
+            echo
+            echo "Coding agents: address only items under \`## Findings\` with a concrete severity, file, claim, evidence, and suggested fix. Treat \`## Non-blocking Notes\` as optional context. Ignore unsupported or style-only feedback."
+          } > "$body_file"
+          jq -n --rawfile body "$body_file" '{body: $body}' > comment.json
+
+          existing_comment_id=$(gh api \
+            "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"$marker\"))) | .id" \
+            | tail -n 1)
+
+          if [ -n "$existing_comment_id" ]; then
+            gh api \
+              --method PATCH \
+              "repos/${{ github.repository }}/issues/comments/$existing_comment_id" \
+              --input comment.json >/dev/null
+          else
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file "$body_file"
+          fi
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
-            -f body="$(printf '## Ollama Code Review\n\n%s' "$(cat review.md)")"
